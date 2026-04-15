@@ -1,16 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import "./App.css";
 
-const STATUS_MESSAGES = [
-  { delay: 0,     text: "Connecting to GitHub…" },
-  { delay: 4000,  text: "Searching repositories…" },
-  { delay: 12000, text: "Aggregating user skill matches…" },
-  { delay: 22000, text: "Fetching READMEs and profile data…" },
-  { delay: 38000, text: "Generating AI summaries via Gemini…" },
-  { delay: 56000, text: "Ranking developers and building PDF…" },
-  { delay: 72000, text: "Almost done — finalising report…" },
-];
-
 function App() {
   const [skillInput, setSkillInput] = useState("");
   const [skills, setSkills]         = useState([]);
@@ -20,16 +10,13 @@ function App() {
   const [success, setSuccess]       = useState(false);
   const [statusMsg, setStatusMsg]   = useState("");
 
-  const timersRef  = useRef([]);
-  const inputRef   = useRef(null);
+  const inputRef    = useRef(null);
+  const readerRef   = useRef(null);   // holds the stream reader so we can cancel
 
-  const clearTimers = () => {
-    timersRef.current.forEach(clearTimeout);
-    timersRef.current = [];
-  };
-  useEffect(() => () => clearTimers(), []);
+  // Cancel stream on unmount
+  useEffect(() => () => readerRef.current?.cancel(), []);
 
-  // Add skill on Enter or comma
+  // ── Skill tag logic ────────────────────────────────────────────────────────
   const handleSkillKeyDown = (e) => {
     if (e.key === "Enter" || e.key === ",") {
       e.preventDefault();
@@ -39,60 +26,40 @@ function App() {
 
   const addSkill = () => {
     const val = skillInput.trim().toLowerCase().replace(/,/g, "");
-    if (!val) return;
-    if (skills.includes(val)) {
-      setSkillInput("");
-      return;
-    }
+    if (!val || skills.includes(val)) { setSkillInput(""); return; }
     setSkills((prev) => [...prev, val]);
     setSkillInput("");
   };
 
-  const removeSkill = (skill) => {
+  const removeSkill = (skill) =>
     setSkills((prev) => prev.filter((s) => s !== skill));
-  };
 
-  const startStatusCycle = () => {
-    clearTimers();
-    STATUS_MESSAGES.forEach(({ delay, text }) => {
-      const t = setTimeout(() => setStatusMsg(text), delay);
-      timersRef.current.push(t);
-    });
-  };
-
+  // ── Generate ───────────────────────────────────────────────────────────────
   const generate = async () => {
     setError("");
     setSuccess(false);
     setStatusMsg("");
 
-    // Flush any partially typed skill
-    const pendingSkill = skillInput.trim().toLowerCase().replace(/,/g, "");
+    // Flush partially typed skill
+    const pending = skillInput.trim().toLowerCase().replace(/,/g, "");
     let finalSkills = skills;
-    if (pendingSkill && !skills.includes(pendingSkill)) {
-      finalSkills = [...skills, pendingSkill];
+    if (pending && !skills.includes(pending)) {
+      finalSkills = [...skills, pending];
       setSkills(finalSkills);
       setSkillInput("");
     }
 
-    if (finalSkills.length === 0) {
-      setError("Please add at least one skill.");
-      return;
-    }
-
+    if (finalSkills.length === 0) { setError("Please add at least one skill."); return; }
     const n = Number(count);
-    if (!n || n < 1) {
-      setError("Count must be at least 1.");
-      return;
-    }
+    if (!n || n < 1) { setError("Count must be at least 1."); return; }
 
     setLoading(true);
-    startStatusCycle();
 
     try {
       const res = await fetch("http://localhost:8000/generate-resume", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skills: finalSkills, count: n }),
+        body:    JSON.stringify({ skills: finalSkills, count: n }),
       });
 
       if (!res.ok) {
@@ -100,38 +67,82 @@ function App() {
         throw new Error(err.detail || `Server error: ${res.status}`);
       }
 
-      const blob = await res.blob();
-      const url  = window.URL.createObjectURL(blob);
-      const a    = document.createElement("a");
-      a.href     = url;
-      a.download = "github_report.pdf";
-      a.click();
-      window.URL.revokeObjectURL(url);
-      setSuccess(true);
-      setStatusMsg("");
+      // ── Read SSE stream ──────────────────────────────────────────────────
+      const reader  = res.body.getReader();
+      readerRef.current = reader;
+      const decoder = new TextDecoder();
+      let   buffer  = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE messages are separated by double newlines
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop();           // keep incomplete tail
+
+        for (const part of parts) {
+          if (!part.trim()) continue;
+
+          // Parse  "event: xxx\ndata: {...}"
+          const eventMatch = part.match(/^event:\s*(\S+)/m);
+          const dataMatch  = part.match(/^data:\s*(.+)/m);
+          if (!eventMatch || !dataMatch) continue;
+
+          const event   = eventMatch[1];
+          let   payload = {};
+          try { payload = JSON.parse(dataMatch[1]); } catch { continue; }
+
+          if (event === "status") {
+            setStatusMsg(payload.message);
+
+          } else if (event === "done") {
+            // Decode base64 PDF and trigger download
+            const bytes  = Uint8Array.from(atob(payload.pdf), (c) => c.charCodeAt(0));
+            const blob   = new Blob([bytes], { type: "application/pdf" });
+            const url    = URL.createObjectURL(blob);
+            const a      = document.createElement("a");
+            a.href       = url;
+            a.download   = "github_report.pdf";
+            a.click();
+            URL.revokeObjectURL(url);
+            setSuccess(true);
+            setStatusMsg("");
+
+          } else if (event === "error") {
+            throw new Error(payload.detail || "An error occurred.");
+          }
+        }
+      }
+
     } catch (err) {
       setError(err.message || "Something went wrong. Please try again.");
       setStatusMsg("");
     } finally {
-      clearTimers();
+      readerRef.current = null;
       setLoading(false);
     }
   };
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="page">
       <div className="container">
         <div className="header">
+          <div className="logo">⚡</div>
           <h1>GitHub Developer Finder</h1>
+          <p className="subtitle">
+            Search GitHub by skills, rank developers, and export a PDF report.
+          </p>
         </div>
 
         <div className="card">
 
-          {/* ── Skills field ── */}
+          {/* Skills */}
           <div className="field">
             <label>Skills</label>
-
-            {/* Tag display box */}
             {skills.length > 0 && (
               <div className="tag-box">
                 {skills.map((s) => (
@@ -142,15 +153,11 @@ function App() {
                       onClick={() => removeSkill(s)}
                       disabled={loading}
                       aria-label={`Remove ${s}`}
-                    >
-                      ×
-                    </button>
+                    >×</button>
                   </span>
                 ))}
               </div>
             )}
-
-            {/* Input box */}
             <div className="skill-input-row">
               <input
                 ref={inputRef}
@@ -165,18 +172,13 @@ function App() {
                 className="add-btn"
                 onClick={addSkill}
                 disabled={loading || !skillInput.trim()}
-                aria-label="Add skill"
-              >
-                Add
-              </button>
+              >Add</button>
             </div>
           </div>
 
-          {/* ── Count field ── */}
+          {/* Count */}
           <div className="field">
-            <label>
-              Number of Developers
-            </label>
+            <label>Number of Developers</label>
             <input
               className="input input-number"
               type="number"
@@ -190,6 +192,7 @@ function App() {
           {error   && <div className="alert error">{error}</div>}
           {success && <div className="alert success">✅ PDF downloaded successfully!</div>}
 
+          {/* Live status from backend */}
           {loading && statusMsg && (
             <div className="status-bar">
               <span className="spinner" />
@@ -201,6 +204,8 @@ function App() {
             {loading ? "Generating…" : "Generate Report"}
           </button>
         </div>
+
+        <p className="footer">Powered by GitHub API · Google Gemini · FastAPI</p>
       </div>
     </div>
   );
